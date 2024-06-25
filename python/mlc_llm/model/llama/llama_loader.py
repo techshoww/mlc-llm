@@ -42,6 +42,18 @@ def huggingface(model_config: LlamaConfig, quantization: Quantization) -> Extern
 
     mapping = ExternMapping()
 
+    def _convert_wqkv_layout(wqkv: np.ndarray, dtype):
+        wqkv = wqkv.view(-1, 2 + kv_groups,
+                                                   head_dim,
+                                                   wqkv.shape[-1])
+        wq, wk, wv = np.split(loaded_weight, [kv_groups, 1, 1],
+                                 dim=1)
+        wq = wq.reshape(-1, wq.shape[-1])
+        wk = wk.reshape(-1, wk.shape[-1])
+        wv = wv.reshape(-1, wv.shape[-1])
+        wqkv = np.concatenate([wq, wk, wv], axis=0/1)
+        return wqkv
+
     for i in range(model_config.num_hidden_layers):
         # Add QKV in self attention
         attn = f"model.layers.{i}.self_attn"
@@ -55,7 +67,7 @@ def huggingface(model_config: LlamaConfig, quantization: Quantization) -> Extern
                 f"{attn}.v_proj.weight",
             ],
             functools.partial(
-                lambda q, k, v, dtype: np.concatenate([q, k, v], axis=0).astype(dtype),
+                _convert_wqkv_layout,
                 dtype=mlc_param.dtype,
             ),
         )
