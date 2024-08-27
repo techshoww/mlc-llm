@@ -20,7 +20,7 @@ from mlc_llm.support import tensor_parallel as tp
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 from mlc_llm.model.minicpm.minicpm_model import MiniCPMConfig, MiniCPMForCausalLM
-from .vit_model import ViTConfig, Resampler, ViT
+from .vit_model import ViTConfig, ViT
 logger = logging.getLogger(__name__)
 
 # pylint: disable=invalid-name,missing-docstring
@@ -260,21 +260,139 @@ class MiniCPMModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+class ResamplerAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
+    def __init__(self, config):
+        self.hidden_size = config.output_dim
+        self.head_dim = 128
+        self.num_heads = self.hidden_size // self.head_dim // config.tensor_parallel_shards
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=True)
+
+    def forward(  # pylint: disable=too-many-arguments, too-many-locals
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attention_mask: Tensor,
+    ):
+        """Forward pass of MistralAttention, performing QKV."""
+        d, h = self.head_dim, self.num_heads
+        b, sq, _ = q.shape
+        _, sk, _ = k.shape
+        assert b == 1, "Only support batch size 1 at this moment."
+        q = self.q_proj(q).reshape(b, sq, h, d)
+        k = self.k_proj(k).reshape(b, sk, h, d)
+        v = self.v_proj(v).reshape(b, sk, h, d)
+        output = op_ext.attention(q, k, v, attention_mask)
+        return self.out_proj(output)
+    
+class Resampler(nn.Module):
+    def __init__(self, config: ViTConfig):
+        self.num_queries = config.num_query
+        self.embed_dim = config.output_dim
+        self.kv_dim = config.hidden_size
+        self.image_len = config.image_len
+
+        self.pos_embed = nn.Parameter((self.num_queries, self.embed_dim))
+        #self.pos_embed_k = nn.Parameter((self.image_len, self.embed_dim))
+        self.pos_embed_k = nn.Parameter((448*448//14//14, self.embed_dim))
+        self.query = nn.Parameter((self.num_queries, self.embed_dim))
+        self.kv_proj = nn.Linear(self.kv_dim, self.embed_dim, bias=False)
+        self.ln_q = nn.LayerNorm(self.embed_dim, config.norm_eps)
+        self.ln_kv = nn.LayerNorm(self.embed_dim, config.norm_eps)
+        self.attn = ResamplerAttention(config)
+        self.ln_post = nn.LayerNorm(self.embed_dim, config.norm_eps)
+        self.proj = nn.Parameter((self.embed_dim, self.embed_dim))
+        self.dtype = 'float32'
+
+
+    def forward(
+        self, 
+        x : Tensor,
+        tgt_size,
+    ):
+        # print(self.pos_embed_k)
+        # print(self.pos_embed_k.data)
+        # print(tgt_size)
+        #if self.pos_embed_k.data is None:
+        #    pos_embed = op.zeros((tgt_size[0] * tgt_size[1], self.embed_dim), dtype=self.pos_embed_k.dtype)
+        #else:
+        #    #pos_embed = self.pos_embed_k.data().reshape(32, 32, self.embed_dim)[:tgt_size[0], :tgt_size[1]].reshape(tgt_size[0] * tgt_size[1], self.embed_dim)
+        #    op.take(self.pos_embed_k)
+        pos_embed = self.pos_embed_k.reshape(32, 32, self.embed_dim)
+        indices_x = nn.core.wrap_nested(tvm.relax.op.arange(0, tgt_size[0], dtype="int32"), "arange")
+        indices_y = nn.core.wrap_nested(tvm.relax.op.arange(0, tgt_size[1], dtype="int32"), "arange")
+        print(pos_embed)
+        print(indices_x)
+        pos_embed = op.take(pos_embed, indices_x, axis=0)
+        pos_embed = op.take(pos_embed, indices_y, axis=1).reshape(tgt_size[0] * tgt_size[1], self.embed_dim)
+
+        x = self.kv_proj(x)
+        x = self.ln_kv(x)
+
+        q = self.ln_q(self.query)
+
+        def _attention_mask(
+            batch_size, q_len, k_len,
+        ):
+            # See `tests/legacy-python/test_sliding_window_mask.py` for its behavior
+            return te.compute(
+                (batch_size, 1, q_len, k_len),
+                lambda b, _, i, j: tir.max_value(self.dtype),
+                name="_attention_mask",
+            )
+
+        attention_mask = op.tensor_expr_op(
+            _attention_mask,
+            name_hint="_attention_mask",
+            args=[
+                1,
+                self.num_queries,
+                self.image_len,
+            ],
+        )
+
+        # print(x.shape, pos_embed.shape, q.shape, self.pos_embed.shape)
+        x = self.attn(
+            (q + self.pos_embed).reshape(1, q.shape[0], q.shape[1]),
+            x + pos_embed.reshape(1, pos_embed.shape[0], pos_embed.shape[1]),
+            x,
+            attention_mask
+        )
+        # print("end")
+
+        x = self.ln_post(x)
+
+        x = op.matmul(x, self.proj)
+        return x
 
 class VisMiniCPM(nn.Module):  # pylint: disable=too-many-instance-attributes
     def __init__(self, config: MiniCPMConfig):
 
-        vit_config = VitConfig()
+        vit_config = ViTConfig()
         self.resampler = Resampler(vit_config)
         self.vpm = ViT(vit_config)
         self.llm = MiniCPMForCausalLM(config)
-
-        
 
     def to(self, dtype: Optional[str] = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
+
+    def image(
+        self,
+        inputs: Tensor
+    ):
+        inputs = (inputs.astype(self.dtype) / 255. - 0.5) / 0.5
+        shape = inputs.shape
+        print("before resampler: ", shape)
+        inputs = self.vpm(inputs)
+        inputs = self.resampler(inputs, ((shape[-2] + 13) // 14, (shape[-1] + 13) // 14))
+        # return self.llm.prefill_embed(inputs, rolling_cache_len, kv_seq_len, cache_offset)
+        
+        return inputs    
 
     def batch_forward(
         self,
